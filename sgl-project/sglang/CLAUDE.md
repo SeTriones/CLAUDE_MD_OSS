@@ -688,3 +688,346 @@ python -m sglang.launch_server --help
 ```
 
 For the complete and most up-to-date list of arguments, always refer to the help output or the source code in `server_args.py`.
+
+## KV Cache Transfer in Prefill-Decode Disaggregation
+
+SGLang implements a sophisticated KV cache transfer mechanism for disaggregated serving where prefill and decode instances run separately. This section details the complete transfer process from prefill to decode instances.
+
+### Architecture Overview
+
+The disaggregation system consists of:
+
+1. **Prefill Instances**: Handle prompt processing and KV cache generation
+2. **Decode Instances**: Handle token generation using transferred KV cache
+3. **Bootstrap Server**: Coordinates registration and connection between instances
+4. **Transfer Backends**: Handle the actual data movement (Mooncake, Ascend, etc.)
+
+### Core Components
+
+#### Base Classes (`disaggregation/base/conn.py`)
+
+- **`KVArgs`**: Contains KV cache configuration including data pointers, lengths, device info
+- **`KVPoll`**: Status constants (Failed=0, Bootstrapping=1, WaitingForInput=2, Transferring=3, Success=4)
+- **`BaseKVManager`**: Abstract manager for transfer state management
+- **`BaseKVSender`**: Abstract prefill-side sender interface
+- **`BaseKVReceiver`**: Abstract decode-side receiver interface
+- **`BaseKVBootstrapServer`**: Abstract bootstrap server interface
+
+#### Transfer Backends
+
+**Mooncake Backend** (`disaggregation/mooncake/`):
+- Uses RDMA/InfiniBand for high-speed transfers
+- Supports batch memory registration and transfers
+- Hardware-accelerated data movement
+- Session-based connection management
+
+**Ascend Backend** (`disaggregation/ascend/`):
+- NPU-specific transfer engine
+- Centralized storage coordination
+- Optimized for Ascend hardware
+
+### Detailed Transfer Process
+
+#### Phase 1: Bootstrap and Registration
+
+1. **Prefill Instance Startup**:
+   ```python
+   # MooncakeKVManager.__init__ for PREFILL mode
+   self.register_buffer_to_engine()  # Register KV cache buffers with transfer engine
+   self._register_to_bootstrap()     # Register with bootstrap server
+   ```
+
+2. **Bootstrap Server Registration** (`mooncake/conn.py:1021-1065`):
+   ```python
+   # Prefill registers its connection info
+   payload = {
+       "role": "Prefill",
+       "attn_tp_size": self.attn_tp_size,
+       "attn_tp_rank": self.attn_tp_rank,
+       "attn_dp_size": self.attn_dp_size,
+       "attn_dp_rank": self.attn_dp_rank,
+       "pp_size": self.pp_size,
+       "pp_rank": self.pp_rank,
+       "rank_ip": self.local_ip,
+       "rank_port": self.rank_port,
+   }
+   ```
+
+3. **Decode Instance Connection**:
+   ```python
+   # MooncakeKVReceiver.__init__
+   bootstrap_info = self._get_bootstrap_info_from_server(target_tp_rank, target_dp_group, target_pp_rank)
+   self._register_kv_args()  # Send decode instance KV buffer info to prefill
+   ```
+
+#### Phase 2: KV Cache Transfer Registration
+
+1. **KV Args Registration** (`mooncake/conn.py:1420-1450`):
+   ```python
+   # Decode instance sends its KV buffer configuration to prefill
+   packed_kv_data_ptrs = b"".join(struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs)
+   packed_aux_data_ptrs = b"".join(struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs)
+
+   sock.send_multipart([
+       "None".encode("ascii"),           # Special registration message
+       self.kv_mgr.local_ip.encode("ascii"),
+       str(self.kv_mgr.rank_port).encode("ascii"),
+       self.session_id.encode("ascii"),
+       packed_kv_data_ptrs,             # Target buffer pointers
+       packed_aux_data_ptrs,            # Auxiliary buffer pointers
+       dst_tp_rank,                     # Target tensor parallel rank
+       dst_attn_tp_size,                # Target attention TP size
+       dst_kv_item_len,                 # KV item length on decode side
+   ])
+   ```
+
+2. **Prefill Bootstrap Thread** (`mooncake/conn.py:810-843`):
+   ```python
+   # Prefill receives and stores decode instance configuration
+   if room == "None":
+       self.decode_kv_args_table[mooncake_session_id] = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+   ```
+
+#### Phase 3: Transfer Request Initialization
+
+1. **Transfer Request Setup** (`mooncake/conn.py:1473-1490`):
+   ```python
+   # Decode instance sends transfer request with KV indices
+   sock.send_multipart([
+       str(self.bootstrap_room).encode("ascii"),    # Unique request identifier
+       self.kv_mgr.local_ip.encode("ascii"),       # Decode instance IP
+       str(self.kv_mgr.rank_port).encode("ascii"), # Decode instance port
+       self.session_id.encode("ascii"),            # Mooncake session ID
+       kv_indices.tobytes() if not is_dummy else b"",  # Target KV indices
+       str(aux_index).encode("ascii") if not is_dummy else b"",  # Auxiliary index
+       str(self.required_dst_info_num).encode("ascii"),  # Expected responses
+   ])
+   ```
+
+2. **Prefill Request Processing** (`mooncake/conn.py:830-842`):
+   ```python
+   # Prefill creates transfer info and updates status
+   self.transfer_infos[room][mooncake_session_id] = TransferInfo.from_zmq(waiting_req_bytes)
+   if len(self.transfer_infos[room]) == required_dst_info_num:
+       self.update_status(room, KVPoll.WaitingForInput)
+   ```
+
+#### Phase 4: KV Cache Data Transfer
+
+1. **Transfer Execution** (`mooncake/conn.py:315-418`):
+   ```python
+   # Main KV cache transfer function
+   def send_kvcache(self, mooncake_session_id, prefill_kv_indices, dst_kv_ptrs, dst_kv_indices, executor):
+       # Group contiguous indices for efficient transfer
+       prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(prefill_kv_indices, dst_kv_indices)
+
+       # Handle different model architectures (MLA vs standard)
+       if self.is_mla_backend:
+           # Single buffer per layer for MLA models
+           layers_params = [(src_kv_ptrs[i], dst_kv_ptrs[i], kv_item_len) for i in range(layers_per_pp_stage)]
+       else:
+           # Separate K and V buffers for standard models
+           layers_params = [(src_k_ptrs[i], dst_k_ptrs[i], kv_item_len) for i in range(layers_per_pp_stage)] + \
+                          [(src_v_ptrs[i], dst_v_ptrs[i], kv_item_len) for i in range(layers_per_pp_stage)]
+   ```
+
+2. **Tensor Parallel Handling** (`mooncake/conn.py:420-583`):
+   ```python
+   # For different TP sizes between prefill and decode
+   def send_kvcache_slice(self, mooncake_session_id, prefill_kv_indices, dst_kv_ptrs, dst_kv_indices, ...):
+       # Calculate head distribution across TP ranks
+       src_heads_per_rank = num_kv_heads
+       dst_heads_per_rank = num_kv_heads * self.attn_tp_size // dst_attn_tp_size
+
+       # Determine slice parameters based on TP configuration
+       if self.attn_tp_size > dst_attn_tp_size:
+           # Multiple prefill ranks → single decode rank
+           dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+       else:
+           # Single prefill rank → multiple decode ranks
+           src_head_start_offset = dst_tp_rank_in_group * dst_heads_per_rank
+   ```
+
+3. **Transfer Worker Execution** (`mooncake/conn.py:668-802`):
+   ```python
+   # Background transfer worker processes transfer chunks
+   def transfer_worker(self, queue, executor):
+       while True:
+           kv_chunk = queue.get()
+           for req in self.transfer_infos[kv_chunk.room].values():
+               if not req.is_dummy:
+                   # Execute actual KV cache transfer
+                   ret = self.send_kvcache(req.mooncake_session_id, kv_chunk.prefill_kv_indices,
+                                         target_rank_registration_info.dst_kv_ptrs, chunked_dst_kv_indice, executor)
+
+                   # Send auxiliary data on last chunk
+                   if kv_chunk.is_last and self.pp_group.is_last_rank:
+                       ret = self.send_aux(req, kv_chunk.prefill_aux_index, target_rank_registration_info.dst_aux_ptrs)
+   ```
+
+#### Phase 5: Auxiliary Data Transfer
+
+1. **Auxiliary Data Handling** (`mooncake/conn.py:584-630`):
+   ```python
+   # Transfer auxiliary data (non-KV cache data)
+   def send_aux(self, req, prefill_aux_index, dst_aux_ptrs):
+       transfer_blocks = []
+       for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+           length = prefill_aux_item_lens[i]
+           src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+           dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+           transfer_blocks.append((src_addr, dst_addr, length))
+       return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+   ```
+
+2. **TCP Fallback for Auxiliary Data** (`mooncake/conn.py:606-654`):
+   ```python
+   # Fallback to TCP for auxiliary data when needed
+   def send_aux_tcp(self, req, prefill_aux_index, dst_aux_ptrs):
+       for i in range(len(prefill_aux_ptrs)):
+           data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+           self.send_aux_data_to_endpoint(remote=req.endpoint, dst_port=req.dst_port,
+                                        room=req.room, buffer_index=i, aux_index=req.dst_aux_index, data=data)
+   ```
+
+#### Phase 6: Status Synchronization and Completion
+
+1. **Status Updates** (`mooncake/conn.py:655-667`):
+   ```python
+   # Sync transfer completion status to decode instance
+   def sync_status_to_decode_endpoint(self, remote, dst_port, room, status, prefill_rank):
+       self._connect(format_tcp_address(remote, dst_port)).send_multipart([
+           str(room).encode("ascii"),
+           str(status).encode("ascii"),
+           str(prefill_rank).encode("ascii"),
+       ])
+   ```
+
+2. **Decode Status Processing** (`mooncake/conn.py:869-898`):
+   ```python
+   # Decode instance processes status updates
+   def decode_thread():
+       while True:
+           msg = self.server_socket.recv_multipart()
+           (bootstrap_room, status, prefill_rank) = msg
+           if status == KVPoll.Success:
+               self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+               if arrived_response_num == expected_response_num:
+                   self.update_status(bootstrap_room, KVPoll.Success)
+   ```
+
+### Key Data Structures
+
+#### TransferInfo (`mooncake/conn.py:82-112`)
+Contains per-request transfer metadata:
+- `room`: Unique request identifier
+- `endpoint`: Decode instance IP address
+- `mooncake_session_id`: Transfer session identifier
+- `dst_kv_indices`: Target KV cache locations
+- `dst_aux_index`: Auxiliary data target index
+- `is_dummy`: Whether this is a dummy request for TP coordination
+
+#### KVArgsRegisterInfo (`mooncake/conn.py:116-140`)
+Contains decode instance buffer configuration:
+- `dst_kv_ptrs`: KV cache buffer pointers
+- `dst_aux_ptrs`: Auxiliary buffer pointers
+- `dst_tp_rank`: Target tensor parallel rank
+- `dst_attn_tp_size`: Target attention TP size
+- `dst_kv_item_len`: KV item length
+
+#### TransferKVChunk (`mooncake/conn.py:72-78`)
+Represents a chunk of KV cache to transfer:
+- `room`: Request identifier
+- `prefill_kv_indices`: Source KV cache indices
+- `index_slice`: Slice of the total transfer
+- `is_last`: Whether this is the final chunk
+- `prefill_aux_index`: Auxiliary data source index
+
+### Transfer Backends Implementation
+
+#### Mooncake Transfer Engine (`mooncake/transfer_engine.py`)
+
+```python
+class MooncakeTransferEngine:
+    def __init__(self, hostname, gpu_id, ib_device):
+        # Initialize with RDMA/InfiniBand support
+        self.engine = TransferEngine()
+        self.initialize(hostname=hostname, device_name=ib_device)
+
+    def batch_transfer_sync(self, session_id, buffers, peer_buffer_addresses, lengths):
+        # High-performance batch transfer using RDMA
+        return self.engine.batch_transfer_sync_write(session_id, buffers, peer_buffer_addresses, lengths)
+
+    def batch_register(self, ptrs, lengths):
+        # Register memory regions for RDMA access
+        return self.engine.batch_register_memory(ptrs, lengths)
+```
+
+#### Memory Registration Process
+
+1. **Buffer Registration** (`mooncake/conn.py:285-297`):
+   ```python
+   def register_buffer_to_engine(self):
+       # Register KV cache buffers with transfer engine
+       if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+           self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+
+       # Register auxiliary buffers
+       if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
+           self.engine.batch_register(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
+   ```
+
+### Error Handling and Recovery
+
+#### Failure Detection (`mooncake/conn.py:899-952`)
+```python
+def heartbeat_checker():
+    # Monitor prefill instance health
+    for bootstrap_addr in addresses:
+        response = session.get(f"http://{bootstrap_addr}/health", timeout=(2, 3))
+        if response.status_code != 200:
+            self.heartbeat_failures[bootstrap_addr] += 1
+            if self.heartbeat_failures[bootstrap_addr] >= self.max_failures:
+                self._handle_node_failure(bootstrap_addr)
+```
+
+#### Transfer Failure Handling (`mooncake/conn.py:740-761`)
+```python
+if ret != 0:  # Transfer failed
+    with self.session_lock:
+        self.session_failures[req.mooncake_session_id] += 1
+        if self.session_failures[req.mooncake_session_id] >= 1:
+            self.failed_sessions.add(req.mooncake_session_id)
+    self.record_failure(kv_chunk.room, f"Failed to send kv chunk of {kv_chunk.room}")
+    self.update_status(kv_chunk.room, KVPoll.Failed)
+```
+
+### Performance Optimizations
+
+1. **Batch Transfers**: Group contiguous memory regions for efficient transfer
+2. **Concurrent Processing**: Multi-threaded transfer workers with thread pools
+3. **Memory Registration**: Pre-register buffers for RDMA efficiency
+4. **Session Reuse**: Cache transfer sessions to avoid setup overhead
+5. **Hardware Acceleration**: Leverage RDMA/InfiniBand for high-speed transfers
+
+### Configuration Options
+
+Key environment variables for tuning:
+- `SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`: Transfer worker thread count
+- `SGLANG_DISAGGREGATION_QUEUE_SIZE`: Transfer queue count
+- `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`: Bootstrap timeout (default: 300s)
+- `SGLANG_DISAGGREGATION_WAITING_TIMEOUT`: Transfer completion timeout (default: 300s)
+- `SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`: Health check interval (default: 5s)
+- `SGLANG_MOONCAKE_CUSTOM_MEM_POOL`: Enable custom memory pool optimization
+
+### Integration with SGLang Runtime
+
+The disaggregation system integrates seamlessly with SGLang's core components:
+
+1. **Memory Management**: Uses existing KV cache allocators and memory pools
+2. **Scheduling**: Coordinates with request scheduling and batching
+3. **Model Execution**: Transparent to model forward passes
+4. **Tensor Parallelism**: Handles different TP sizes between prefill and decode
+5. **Pipeline Parallelism**: Supports PP stages in prefill instances
+
+This comprehensive KV cache transfer mechanism enables efficient disaggregated serving while maintaining high performance and reliability through sophisticated error handling, optimization strategies, and seamless integration with SGLang's runtime architecture.
