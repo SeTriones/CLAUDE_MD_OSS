@@ -307,6 +307,186 @@ SM90FP8Gemm1D2DRuntime::launch(runtime, args);
 
 This dynamic generation approach allows DeepGEMM to achieve performance comparable to expert-tuned libraries while maintaining flexibility for arbitrary input sizes and configurations.
 
+## NVCC vs NVRTC Compilation
+
+DeepGEMM provides two distinct compilation paths for JIT kernel generation, each with different tradeoffs in terms of performance, compilation speed, and functionality.
+
+### Compilation Mechanisms
+
+#### NVCC (NVIDIA CUDA Compiler)
+
+**Process:**
+```cpp
+// External process compilation
+const auto& command = fmt::format("{} {} -o {} {}",
+    nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+const auto& [return_code, output] = call_external_command(command);
+```
+
+**Key Characteristics:**
+- **External Process**: Spawns separate `nvcc` process for each compilation
+- **Filesystem I/O**: Writes temporary files, reads output from stdout/stderr
+- **Full Optimizations**: Access to complete NVCC optimization pipeline
+- **Host Compiler Integration**: Uses system compiler for host code generation
+
+**Compilation Flags:**
+```bash
+-std=c++20 --gpu-architecture=sm_{} \
+--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi \
+-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda
+```
+
+#### NVRTC (NVIDIA Runtime Compiler)
+
+**Process:**
+```cpp
+// In-process compilation
+nvrtcProgram program;
+DG_NVRTC_CHECK(nvrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
+const auto& compile_result = nvrtcCompileProgram(program, num_options, option_cstrs);
+
+// Direct CUBIN access
+DG_NVRTC_CHECK(nvrtcGetCUBINSize(program, &cubin_size));
+DG_NVRTC_CHECK(nvrtcGetCUBIN(program, cubin_data.data()));
+```
+
+**Key Characteristics:**
+- **In-Process**: Compilation occurs within the same process
+- **Memory-Based**: No temporary files, direct memory access
+- **Limited Optimizations**: Subset of NVCC optimizations
+- **API-Based**: Programmatic interface with fine-grained control
+
+**Compilation Flags:**
+```bash
+-std=c++20 --gpu-architecture=sm_{} -default-device \
+--pch  # Precompiled Headers (12.8+)
+```
+
+### Key Differences
+
+| Aspect | NVCC | NVRTC |
+|--------|------|-------|
+| **Process Model** | External process | In-process library |
+| **Compilation Speed** | Slower (process overhead) | Faster (no process spawn) |
+| **Performance** | Higher (full optimizations) | Lower (limited optimizations) |
+| **Memory Usage** | Higher (process isolation) | Lower (shared memory space) |
+| **Precompiled Headers** | Not supported | Supported (12.8+) |
+| **Debugging** | Easier (traditional tools) | Harder (API-based) |
+| **Error Reporting** | Stdout/stderr capture | Programmatic log access |
+
+### Performance Tradeoffs
+
+#### NVCC Advantages
+1. **Maximum Performance**: Full optimization pipeline including:
+   - Advanced register allocation
+   - Instruction scheduling
+   - Memory coalescing optimization
+   - Loop unrolling and vectorization
+
+2. **Mature Tooling**: Integration with:
+   - CUDA profiler tools
+   - Traditional debugging workflows
+   - IDE support and syntax highlighting
+
+3. **Architecture Features**: Better support for:
+   - Latest SM90/SM100 features
+   - Complex tensor core operations
+   - Advanced memory patterns
+
+#### NVRTC Advantages
+1. **Compilation Speed**: Significant speedup from:
+   - No process spawning overhead
+   - Precompiled headers (PCH) support
+   - Direct memory operations
+   - Reduced filesystem I/O
+
+2. **Resource Efficiency**: Lower overhead from:
+   - Shared memory space
+   - No temporary file management
+   - Reduced system calls
+
+3. **Integration Benefits**: Better for:
+   - Embedded applications
+   - Runtime-sensitive workloads
+   - Memory-constrained environments
+
+### Version Requirements
+
+**Minimum Supported Versions:**
+- **NVCC**: 12.3+ (recommended 12.9+ for best performance)
+- **NVRTC**: 12.3+ (recommended 12.8+ for PCH support)
+
+**Feature Support:**
+```cpp
+// NVCC 12.9+ - Architecture family suffix support
+const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
+
+// NVRTC 12.8+ - Precompiled Headers
+if (major > 12 or minor >= 8) {
+    pch_flags = "--pch ";  // Vital for compilation speed
+}
+```
+
+### Usage Scenarios
+
+#### Use NVCC When:
+- **Maximum performance is critical** (production workloads)
+- **Running on varied hardware configurations**
+- **Complex kernels requiring advanced optimizations**
+- **Debugging and development workflows**
+- **Long-running applications with infrequent compilation**
+
+#### Use NVRTC When:
+- **Compilation latency is critical** (interactive applications)
+- **Memory-constrained environments**
+- **Frequent kernel compilation** (exploratory workloads)
+- **Embedded or containerized deployments**
+- **Development and prototyping phases**
+
+### Selection Mechanism
+
+```cpp
+// Compiler selection based on environment variable
+static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
+    if (get_env<int>("DG_JIT_USE_NVRTC", 0)) {
+        return std::make_shared<NVRTCCompiler>();  // Faster compilation
+    } else {
+        return std::make_shared<NVCCCompiler>();   // Better performance
+    }
+});
+```
+
+**Environment Variable Control:**
+```bash
+# Use NVRTC for faster compilation (may have performance impact)
+export DG_JIT_USE_NVRTC=1
+
+# Use NVCC for maximum performance (default)
+export DG_JIT_USE_NVRTC=0
+```
+
+### Practical Considerations
+
+**Cache Behavior:**
+- Both compilers use the same caching mechanism
+- Cache keys include compiler signature to avoid cross-compiler issues
+- Performance differences primarily affect first-time compilation
+
+**Debugging Support:**
+```bash
+# Enable detailed compilation output for both compilers
+export DG_JIT_DEBUG=1
+export DG_JIT_PRINT_COMPILER_COMMAND=1
+
+# Enable PTXAS verbose output (NVCC only)
+export DG_JIT_PTXAS_VERBOSE=1
+```
+
+**Recommendation:**
+- **Development/Prototyping**: Use NVRTC for faster iteration
+- **Production/Benchmarking**: Use NVCC for maximum performance
+- **Hybrid Approach**: Switch based on workload characteristics
+
 ### Environment Variables
 
 Key environment variables for development:
