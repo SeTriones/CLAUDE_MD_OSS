@@ -726,6 +726,110 @@ The disaggregation system consists of:
 - Centralized storage coordination
 - Optimized for Ascend hardware
 
+### Bootstrap Server
+
+The **Bootstrap Server** is a coordination service that enables communication between prefill and decode instances in SGLang's disaggregated serving architecture.
+
+#### Purpose and Design
+
+The Bootstrap Server acts as a **service discovery and connection broker** between:
+- **Prefill instances** (handle prompt processing and KV cache generation)
+- **Decode instances** (handle token generation using transferred KV cache)
+
+#### Key Functions
+
+1. **Service Registration**
+   ```python
+   # Prefill instances register themselves
+   payload = {
+       "role": "Prefill",
+       "attn_tp_size": self.attn_tp_size,
+       "attn_tp_rank": self.attn_tp_rank,
+       "attn_dp_size": self.attn_dp_size,
+       "attn_dp_rank": self.attn_dp_rank,
+       "pp_size": self.pp_size,
+       "pp_rank": self.pp_rank,
+       "rank_ip": self.local_ip,
+       "rank_port": self.rank_port,
+   }
+   ```
+
+2. **Connection Discovery**
+   ```python
+   # Decode instances query for prefill connection info
+   url = f"http://{bootstrap_addr}/route?engine_rank={target_tp_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+   response = requests.get(url)
+   bootstrap_info = response.json()  # Returns IP, port, and connection details
+   ```
+
+3. **Parallel Configuration Coordination**
+   ```python
+   # Synchronize parallel configuration between instances
+   prefill_parallel_info = {
+       "prefill_attn_tp_size": self.attn_tp_size,
+       "prefill_dp_size": self.dp_size,
+       "prefill_pp_size": self.pp_size,
+   }
+   ```
+
+#### Implementation Details
+
+**HTTP REST API** (`disaggregation/mooncake/conn.py:1572-1665`):
+- **PUT `/route`**: Prefill instances register their connection details
+- **GET `/route`**: Decode instances query for prefill instance locations
+- **GET `/health`**: Health check endpoint for monitoring
+
+**Registration Table Structure**:
+```python
+# Hierarchical storage: [dp_group][tp_rank][pp_rank] -> connection_info
+self.prefill_port_table: Dict[int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]] = {}
+
+# Example entry:
+prefill_port_table[dp_group][tp_rank][pp_rank] = {
+    "rank_ip": "192.168.1.100",
+    "rank_port": 12345,
+}
+```
+
+#### Why It's Needed
+
+**Problem**: Dynamic Service Discovery
+In disaggregated serving:
+- Prefill and decode instances may be on different nodes
+- Instances need to find each other dynamically
+- Multiple parallel configurations (TP, DP, PP) need coordination
+
+**Solution**: Centralized Coordination
+The Bootstrap Server provides:
+1. **Service Registry**: Central location for instance registration
+2. **Load Balancing**: Distributes connections across available instances
+3. **Configuration Validation**: Ensures compatible parallel configurations
+4. **Health Monitoring**: Tracks instance availability
+
+#### Lifecycle Example
+
+```python
+# 1. Prefill instance starts and registers
+prefill_instance.register_to_bootstrap(ip="192.168.1.100", port=12345)
+
+# 2. Decode instance queries for prefill location
+decode_instance.query_bootstrap(target_tp_rank=0, target_dp_group=0)
+# Returns: {"rank_ip": "192.168.1.100", "rank_port": 12345}
+
+# 3. Direct KV cache transfer between instances
+decode_instance.connect_to_prefill("192.168.1.100:12345")
+prefill_instance.transfer_kv_cache(decode_instance)
+```
+
+#### Key Design Benefits
+
+1. **Decoupling**: Instances don't need to know each other's locations in advance
+2. **Scalability**: New instances can join dynamically
+3. **Fault Tolerance**: Failed instances can be detected and replaced
+4. **Multi-tenancy**: Supports multiple parallel configurations simultaneously
+
+The Bootstrap Server is essentially SGLang's **"service mesh control plane"** for disaggregated serving, enabling flexible and scalable deployment of prefill and decode instances across distributed infrastructure.
+
 ### Detailed Transfer Process
 
 #### Phase 1: Bootstrap and Registration
